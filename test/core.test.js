@@ -8,6 +8,10 @@ import {
   resolveSettings,
   projectFolder,
   checkpointPath,
+  effectiveThreshold,
+  sizeProblem,
+  INITIAL_STATE,
+  step,
 } from "../src/core.js";
 
 test("defaults match the spec", () => {
@@ -77,4 +81,67 @@ test("checkpointPath: an absolute dir is used as is, and a hostile session id ca
   const path = checkpointPath({ settings, cwd: "/p", sessionId: "../../etc/passwd", home: "/home/adam" });
   assert.equal(path, "/var/tmp/cp/--p--/.._.._etc_passwd.md");
   assert.ok(path.startsWith("/var/tmp/cp/--p--/"));
+});
+const turn = (percent, extra = {}) => ({ type: "turn_end", percent, threshold: 80, enabled: true, compactAfterSave: true, ...extra });
+
+test("effectiveThreshold: the configured percent on a large window, below pi's own trigger on a small one", () => {
+  assert.equal(effectiveThreshold({ thresholdPercent: 80, contextWindow: 262144, reserveTokens: 8192 }), 80);
+  // 32K model: pi compacts at (32768-8192)/32768 = 75%, so the checkpoint must fire at 70%
+  assert.equal(effectiveThreshold({ thresholdPercent: 80, contextWindow: 32768, reserveTokens: 8192 }), 70);
+  assert.equal(effectiveThreshold({ thresholdPercent: 50, contextWindow: 32768, reserveTokens: 8192 }), 50);
+  assert.equal(effectiveThreshold({ thresholdPercent: 80, contextWindow: 0, reserveTokens: 8192 }), 80);
+  assert.equal(effectiveThreshold({ thresholdPercent: 80, contextWindow: 8192, reserveTokens: 8192 }), 1);
+});
+
+test("sizeProblem: empty and over-long content are refused with the limit stated", () => {
+  assert.equal(sizeProblem("Goal: x", 100), undefined);
+  assert.equal(sizeProblem("x".repeat(100), 100), undefined);
+  assert.match(sizeProblem("x".repeat(101), 100), /101 characters.*limit is 100/);
+  assert.match(sizeProblem("   ", 100), /empty/);
+  assert.match(sizeProblem(undefined, 100), /empty/);
+});
+
+test("step: watching does nothing below the threshold, when usage is unknown, or when disabled", () => {
+  assert.equal(INITIAL_STATE, "watching");
+  assert.deepEqual(step("watching", turn(79)), { state: "watching", actions: [] });
+  assert.deepEqual(step("watching", turn(null)), { state: "watching", actions: [] });
+  assert.deepEqual(step("watching", turn(95, { enabled: false })), { state: "watching", actions: [] });
+});
+
+test("step: crossing the threshold requests a save once", () => {
+  assert.deepEqual(step("watching", turn(80)), { state: "requested", actions: ["request"] });
+});
+
+test("step: a save after the request leads to compaction at the end of that turn", () => {
+  assert.deepEqual(step("requested", { type: "saved" }), { state: "saved", actions: [] });
+  assert.deepEqual(step("saved", turn(85)), { state: "compacting", actions: ["compact"] });
+  assert.deepEqual(step("compacting", turn(85)), { state: "compacting", actions: [] });
+});
+
+test("step: no save -> one reminder -> compact anyway with a warning", () => {
+  assert.deepEqual(step("requested", turn(85)), { state: "reminded", actions: ["remind"] });
+  assert.deepEqual(step("reminded", { type: "saved" }), { state: "saved", actions: [] });
+  assert.deepEqual(step("reminded", turn(88)), { state: "compacting", actions: ["warn_unsaved", "compact"] });
+});
+
+test("step: with compactAfterSave off it settles instead of compacting", () => {
+  const off = { compactAfterSave: false };
+  assert.deepEqual(step("saved", turn(85, off)), { state: "settled", actions: [] });
+  assert.deepEqual(step("reminded", turn(85, off)), { state: "settled", actions: ["warn_unsaved"] });
+  assert.deepEqual(step("settled", turn(99, off)), { state: "settled", actions: [] });
+});
+
+test("step: a voluntary save while watching changes nothing", () => {
+  assert.deepEqual(step("watching", { type: "saved" }), { state: "watching", actions: [] });
+});
+
+test("step: any compaction restores and re-arms; a failed one re-arms without restoring", () => {
+  for (const state of ["watching", "requested", "reminded", "saved", "compacting", "settled"]) {
+    assert.deepEqual(step(state, { type: "compacted" }), { state: "watching", actions: ["restore"] }, state);
+    assert.deepEqual(step(state, { type: "compact_failed" }), { state: "watching", actions: [] }, state);
+  }
+});
+
+test("step: an unknown event leaves the state alone", () => {
+  assert.deepEqual(step("requested", { type: "nonsense" }), { state: "requested", actions: [] });
 });

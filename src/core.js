@@ -65,3 +65,64 @@ export function checkpointPath({ settings, cwd, sessionId, home }) {
   const root = settings.dir.startsWith("~/") ? join(home, settings.dir.slice(2)) : settings.dir;
   return join(root, projectFolder(cwd), settings.file.replaceAll("{session}", session));
 }
+
+// pi compacts at (contextWindow - reserveTokens); the checkpoint must come
+// first, so it fires at least this many points below that.
+const PI_TRIGGER_MARGIN = 5;
+
+export function effectiveThreshold({ thresholdPercent, contextWindow, reserveTokens }) {
+  if (!(contextWindow > 0)) return thresholdPercent;
+  const piTrigger = ((contextWindow - reserveTokens) / contextWindow) * 100;
+  return Math.max(1, Math.min(thresholdPercent, Math.floor(piTrigger - PI_TRIGGER_MARGIN)));
+}
+
+// Why a save is refused, or undefined when it is fine. Nothing is trimmed:
+// the model is told the limit and shortens the text itself.
+export function sizeProblem(content, maxChars) {
+  if (typeof content !== "string" || content.trim() === "") {
+    return "content is empty: write the progress to save";
+  }
+  if (content.length > maxChars) {
+    return `content is ${content.length} characters; the limit is ${maxChars}. Shorten it and call save_progress again`;
+  }
+  return undefined;
+}
+
+// watching -> requested -> (reminded ->) saved -> compacting -> watching
+// `settled` replaces `compacting` when compactAfterSave is off: the request is
+// done and pi compacts on its own schedule.
+export const INITIAL_STATE = "watching";
+
+function onTurnEnd(state, { percent, threshold, enabled, compactAfterSave }) {
+  const finish = (actions) =>
+    compactAfterSave ? { state: "compacting", actions: [...actions, "compact"] } : { state: "settled", actions };
+  switch (state) {
+    case "watching":
+      return enabled && typeof percent === "number" && percent >= threshold
+        ? { state: "requested", actions: ["request"] }
+        : { state, actions: [] };
+    case "requested":
+      return { state: "reminded", actions: ["remind"] };
+    case "reminded":
+      return finish(["warn_unsaved"]);
+    case "saved":
+      return finish([]);
+    default:
+      return { state, actions: [] };
+  }
+}
+
+export function step(state, event) {
+  switch (event.type) {
+    case "turn_end":
+      return onTurnEnd(state, event);
+    case "saved":
+      return state === "requested" || state === "reminded" ? { state: "saved", actions: [] } : { state, actions: [] };
+    case "compacted":
+      return { state: "watching", actions: ["restore"] };
+    case "compact_failed":
+      return { state: "watching", actions: [] };
+    default:
+      return { state, actions: [] };
+  }
+}
