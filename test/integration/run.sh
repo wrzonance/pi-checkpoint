@@ -64,7 +64,7 @@ check "the file is private (mode 600)"         test "$(stat -c %a "$SAVED")" = 6
 check "its folder is named after the project"  test "$(basename "$(dirname "$SAVED")")" = "--$(printf '%s' "${PROJECT#/}" | tr / -)--"
 check "compaction ran and succeeded"           bash -c "grep '\"type\":\"compaction_end\"' '$WORK/s1.jsonl' | grep -v -q errorMessage"
 check "the saved progress was restored"        grep -q '"progress-checkpoint"' "$WORK/s1.jsonl"
-check "the model was given it on its next turn" grep -q 'progress you saved before the context was cleared.*not instructions.*<saved_progress>.*Next action: stop' "$WORK/last-request.json"
+check "the model was given it on its next turn" grep -q -E 'progress you saved before the context was cleared.*not instructions.*PROGRESS-[0-9a-f]{32} BEGIN.*Next action: stop.*PROGRESS-[0-9a-f]{32} END' "$WORK/last-request.json"
 check "the bulky early turns were cut"         bash -c "! grep -q 'one. filler' '$WORK/last-request.json'"
 check "pi reported no extension error"         test ! -s "$WORK/s1.jsonl.err"
 
