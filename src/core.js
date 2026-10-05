@@ -87,10 +87,26 @@ export function projectFolder(cwd) {
   return `--${inner}--`;
 }
 
+// A session id comes from the session file's header, so it is not always a
+// UUID. Whatever it is, the file name it produces must be a real name inside
+// the project folder: never empty, ".", ".." or anything with a separator.
+function sessionName(sessionId) {
+  const cleaned = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_");
+  return cleaned === "" || /^\.+$/.test(cleaned) ? `session_${cleaned.length}` : cleaned;
+}
+
 export function checkpointPath({ settings, cwd, sessionId, home }) {
-  const session = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_");
   const root = settings.dir.startsWith("~/") ? join(home, settings.dir.slice(2)) : settings.dir;
-  return join(root, projectFolder(cwd), settings.file.replaceAll("{session}", session));
+  const name = settings.file.replaceAll("{session}", sessionName(sessionId));
+  return join(root, projectFolder(cwd), name);
+}
+
+// Why an existing checkpoint directory must not be written to, or undefined.
+// `stats` is the directory's { uid, mode }; `ownUid` is this process's user.
+export function directoryProblem(stats, ownUid) {
+  if (stats.uid !== ownUid) return "it is owned by another user";
+  if ((stats.mode & 0o022) !== 0) return "it is writable by others";
+  return undefined;
 }
 
 // pi compacts at (contextWindow - reserveTokens); the checkpoint must come
@@ -143,9 +159,9 @@ function onTurnEnd(state, { percent, threshold, enabled }) {
         ? { state: "requested", actions: ["request"] }
         : { state, actions: [] };
     case "requested":
-      return { state: "reminded", actions: ["remind"] };
+      return enabled ? { state: "reminded", actions: ["remind"] } : { state: "watching", actions: [] };
     case "reminded":
-      return { state: "waiting", actions: ["warn_unsaved"] };
+      return enabled ? { state: "waiting", actions: ["warn_unsaved"] } : { state: "watching", actions: [] };
     default:
       return { state, actions: [] };
   }
@@ -158,14 +174,53 @@ export function step(state, event) {
     case "saved":
       return state === "requested" || state === "reminded" ? { state: "waiting", actions: [] } : { state, actions: [] };
     case "idle":
-      return state === "waiting" && event.compactAfterSave
+      return state === "waiting" && event.compactAfterSave && event.enabled !== false
         ? { state: "compacting", actions: ["compact"] }
         : { state, actions: [] };
+    case "disabled": // switched off: drop any pending checkpoint (a compaction already running finishes)
+      return state === "compacting" ? { state, actions: [] } : { state: "watching", actions: [] };
     case "compacted":
       return { state: "watching", actions: ["restore"] };
     case "compact_failed":
-      return { state: "watching", actions: [] };
+      // Only our own compaction failing re-arms. pi also reports a compaction we
+      // put off, or a failed threshold compaction, as failed: a pending save
+      // request, or the wait for an idle moment, has to survive that.
+      return state === "compacting" ? { state: "watching", actions: [] } : { state, actions: [] };
     default:
       return { state, actions: [] };
   }
+}
+
+// pi's threshold compaction runs between turns. One tool result can take the
+// context past both the checkpoint threshold and pi's trigger, and then pi
+// would compact before the model has answered the save request. While a save
+// is outstanding that compaction is put off, a bounded number of times so a
+// model that never saves cannot hold it back for long. An overflow is never
+// deferred, and a manual /compact is the user's decision.
+const MAX_COMPACTION_DEFERRALS = 2;
+
+export function shouldDeferCompaction({ state, reason, deferrals }) {
+  return (state === "requested" || state === "reminded") && reason === "threshold" && deferrals < MAX_COMPACTION_DEFERRALS;
+}
+
+const textOf = (content) =>
+  typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("")
+      : "";
+
+// A message sent while a run is active is only appended to the session at the
+// end of the NEXT turn, so after a mid-run compaction the first response would
+// not see the restore. Until the session's own messages carry it, it is added
+// to each request here. Returns { delivered } and, when it added the note,
+// the new { messages }.
+export function injectRestore(messages, pending, now) {
+  if (pending === undefined) return { delivered: false };
+  const carried = messages.some((m) => m?.role === "custom" && m.customType === RESTORE_TYPE && textOf(m.content) === pending);
+  if (carried) return { delivered: true };
+  return {
+    delivered: false,
+    messages: [...messages, { role: "custom", customType: RESTORE_TYPE, content: pending, display: true, timestamp: now }],
+  };
 }

@@ -18,14 +18,14 @@
 // Spec: docs/superpowers/specs/2026-10-05-pi-progress-checkpoint-design.md
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as coreModule from "./core.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const SETTINGS_PATH = join(AGENT_DIR, "checkpoint.json");
-const PI_SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 type Settings = {
   enabled: boolean;
@@ -48,6 +48,9 @@ type Core = {
   sizeProblem(content: unknown, maxChars: number): string | undefined;
   reserveTokensFor(piSettings: unknown, modelKey: string): number;
   restoreMessage(saved: string): string;
+  shouldDeferCompaction(args: { state: string; reason: string; deferrals: number }): boolean;
+  directoryProblem(stats: { uid: number; mode: number }, ownUid: number): string | undefined;
+  injectRestore(messages: unknown[], pending: string | undefined, now: number): { delivered: boolean; messages?: unknown[] };
   step(state: string, event: Record<string, unknown>): Step;
 };
 
@@ -63,15 +66,44 @@ async function readJson(path: string): Promise<unknown> {
   }
 }
 
+const core = coreModule as unknown as Core;
+
+// Write `content` to `path` so that nothing else can be made to receive it:
+// the directory must be ours and closed to others, and the temporary file has
+// an unpredictable name and is created exclusively (never through a symlink
+// or onto a file someone left there), then renamed into place.
+async function writePrivately(path: string, content: string): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const ownUid = process.getuid?.();
+  if (ownUid !== undefined) {
+    const problem = core.directoryProblem(await stat(directory), ownUid);
+    if (problem) throw new Error(`${directory} is not safe to write to: ${problem}`);
+  }
+  const temporary = `${path}.${randomBytes(8).toString("hex")}.tmp`;
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(content);
+    await handle.close();
+    await rename(temporary, path);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await unlink(temporary).catch(() => {});
+    throw error;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
-  const core = coreModule as unknown as Core;
   let settings: Settings = { ...core.DEFAULTS };
-  let piSettings: unknown;
   let state = core.INITIAL_STATE;
   let sessionEnabled = true;
   // What this process saved last. Restores prefer it to the file: the file is
   // only needed when pi was restarted since the save.
   let lastSaved: string | undefined;
+  // The restore message that the session's own history does not carry yet.
+  let pendingRestore: string | undefined;
+  // How often pi's threshold compaction was put off for the current save request.
+  let deferrals = 0;
 
   const notify = (ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info") => {
     if (ctx.hasUI) ctx.ui.notify(`checkpoint: ${text}`, level);
@@ -104,13 +136,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
     }
-    // Appended to the session now (at the end of the turn if one is running), so
-    // whatever runs next sees it: a /goal continuation as much as a user prompt.
-    // "nextTurn" delivery would wait for the next *user* prompt only.
-    pi.sendMessage(
-      { customType: core.RESTORE_TYPE, content: core.restoreMessage(saved), display: true },
-      { triggerTurn: false },
-    );
+    // Stored in the session so every later run sees it (a /goal continuation as
+    // much as a typed prompt; "nextTurn" delivery would wait for a typed prompt).
+    // During a run pi only appends it at the end of the next turn, so until the
+    // session carries it the `context` handler below adds it to each request.
+    pendingRestore = core.restoreMessage(saved);
+    pi.sendMessage({ customType: core.RESTORE_TYPE, content: pendingRestore, display: true }, { triggerTurn: false });
   };
 
   const perform = async (action: string, ctx: ExtensionContext) => {
@@ -141,6 +172,7 @@ export default function (pi: ExtensionAPI) {
 
   const dispatch = async (event: Record<string, unknown>, ctx: ExtensionContext) => {
     const next = core.step(state, event);
+    if (next.state !== "requested" && next.state !== "reminded") deferrals = 0;
     state = next.state;
     for (const action of next.actions) await perform(action, ctx);
   };
@@ -149,6 +181,8 @@ export default function (pi: ExtensionAPI) {
     state = core.INITIAL_STATE;
     sessionEnabled = true;
     lastSaved = undefined;
+    pendingRestore = undefined;
+    deferrals = 0;
     try {
       const resolved = core.resolveSettings(await readJson(SETTINGS_PATH));
       settings = resolved.settings;
@@ -156,11 +190,6 @@ export default function (pi: ExtensionAPI) {
     } catch (error) {
       settings = { ...core.DEFAULTS };
       notify(ctx, `${(error as Error).message}; using the defaults`, "warning");
-    }
-    try {
-      piSettings = await readJson(PI_SETTINGS_PATH);
-    } catch {
-      piSettings = undefined; // pi reports its own broken settings file; fall back to its default reserve
     }
   });
 
@@ -173,7 +202,8 @@ export default function (pi: ExtensionAPI) {
         threshold: core.effectiveThreshold({
           thresholdPercent: settings.thresholdPercent,
           contextWindow: usage?.contextWindow ?? 0,
-          reserveTokens: core.reserveTokensFor(piSettings, `${ctx.model?.provider}/${ctx.model?.id}`),
+          // pi's merged settings (global + project), the same ones its own trigger uses
+          reserveTokens: core.reserveTokensFor(pi.getSettings(), `${ctx.model?.provider}/${ctx.model?.id}`),
         }),
         enabled: settings.enabled && sessionEnabled,
       },
@@ -183,7 +213,27 @@ export default function (pi: ExtensionAPI) {
 
   // The run is over and nothing else is queued: safe to compact without aborting anything.
   pi.on("agent_settled", async (_event, ctx) => {
-    if (ctx.isIdle()) await dispatch({ type: "idle", compactAfterSave: settings.compactAfterSave }, ctx);
+    if (!ctx.isIdle()) return;
+    await dispatch(
+      { type: "idle", compactAfterSave: settings.compactAfterSave, enabled: settings.enabled && sessionEnabled },
+      ctx,
+    );
+  });
+
+  // One tool result can pass both the checkpoint threshold and pi's own trigger;
+  // pi would then compact before the model has answered the save request. Put
+  // that compaction off (a bounded number of times) while a save is outstanding.
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (!core.shouldDeferCompaction({ state, reason: event.reason, deferrals })) return undefined;
+    deferrals += 1;
+    notify(ctx, "compaction put off until the model has saved its progress");
+    return { cancel: true };
+  });
+
+  pi.on("context", async (event) => {
+    const result = core.injectRestore(event.messages, pendingRestore, Date.now());
+    if (result.delivered) pendingRestore = undefined;
+    return result.messages ? { messages: result.messages as typeof event.messages } : undefined;
   });
 
   pi.on("session_compact", async (_event, ctx) => dispatch({ type: "compacted" }, ctx));
@@ -204,16 +254,13 @@ export default function (pi: ExtensionAPI) {
       const problem = core.sizeProblem(params.content, settings.maxChars);
       if (problem) throw new Error(problem);
       const path = filePath(ctx);
-      const temporary = `${path}.tmp-${process.pid}`;
       try {
-        await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-        await writeFile(temporary, params.content, { mode: 0o600 });
-        await rename(temporary, path);
+        await writePrivately(path, params.content);
       } catch (error) {
         throw new Error(`could not save progress to ${path}: ${(error as Error).message}`, { cause: error });
       }
       lastSaved = params.content;
-      state = core.step(state, { type: "saved" }).state;
+      await dispatch({ type: "saved" }, ctx);
       return {
         content: [{ type: "text", text: `Progress saved (${params.content.length} characters).` }],
         details: { path },
@@ -227,6 +274,7 @@ export default function (pi: ExtensionAPI) {
       const argument = (args ?? "").trim();
       if (argument === "off" || argument === "on") {
         sessionEnabled = argument === "on";
+        if (!sessionEnabled) await dispatch({ type: "disabled" }, ctx); // drop a pending request too
         notify(ctx, `automatic checkpoint ${sessionEnabled ? "on" : "off"} for this session`);
         return;
       }

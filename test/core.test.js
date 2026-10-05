@@ -14,6 +14,9 @@ import {
   step,
   reserveTokensFor,
   restoreMessage,
+  shouldDeferCompaction,
+  directoryProblem,
+  injectRestore,
 } from "../src/core.js";
 
 test("defaults match the spec", () => {
@@ -139,10 +142,19 @@ test("step: a voluntary save while watching changes nothing", () => {
   assert.deepEqual(step("watching", { type: "saved" }), { state: "watching", actions: [] });
 });
 
-test("step: any compaction restores and re-arms; a failed one re-arms without restoring", () => {
+test("step: any compaction restores and re-arms", () => {
   for (const state of ["watching", "requested", "reminded", "waiting", "compacting"]) {
     assert.deepEqual(step(state, { type: "compacted" }), { state: "watching", actions: ["restore"] }, state);
-    assert.deepEqual(step(state, { type: "compact_failed" }), { state: "watching", actions: [] }, state);
+  }
+});
+
+test("step: a failed compaction re-arms only our own; a pending checkpoint survives someone else's", () => {
+  // pi reports a compaction we put off ourselves (and any failed threshold
+  // compaction) as failed. The save request, or the wait for an idle moment,
+  // must survive that: found by the mid-run integration scenario.
+  assert.deepEqual(step("compacting", { type: "compact_failed" }), { state: "watching", actions: [] });
+  for (const state of ["watching", "requested", "reminded", "waiting"]) {
+    assert.deepEqual(step(state, { type: "compact_failed" }), { state, actions: [] }, state);
   }
 });
 
@@ -192,4 +204,75 @@ test("restoreMessage: the default marker is long, random and different every tim
   const b = marker(restoreMessage("note"));
   assert.match(a, /^[0-9a-f]{32}$/);
   assert.notEqual(a, b);
+});
+
+// ---- findings from the Codex review, 2026-10-05 ----
+
+test("shouldDeferCompaction: pi's threshold compaction waits while a save is outstanding, a bounded number of times", () => {
+  // One tool result can cross both the checkpoint threshold and pi's own trigger:
+  // without this, pi compacts before the model has answered the save request.
+  for (const state of ["requested", "reminded"]) {
+    assert.equal(shouldDeferCompaction({ state, reason: "threshold", deferrals: 0 }), true, state);
+    assert.equal(shouldDeferCompaction({ state, reason: "threshold", deferrals: 1 }), true, state);
+    assert.equal(shouldDeferCompaction({ state, reason: "threshold", deferrals: 2 }), false, "bounded");
+  }
+  for (const state of ["watching", "waiting", "compacting"]) {
+    assert.equal(shouldDeferCompaction({ state, reason: "threshold", deferrals: 0 }), false, state);
+  }
+  // an overflow must compact now, and a manual /compact is the user's call
+  assert.equal(shouldDeferCompaction({ state: "requested", reason: "overflow", deferrals: 0 }), false);
+  assert.equal(shouldDeferCompaction({ state: "requested", reason: "manual", deferrals: 0 }), false);
+});
+
+test("step: switching off disarms a pending checkpoint and stops further automatic actions", () => {
+  for (const state of ["requested", "reminded", "waiting", "watching"]) {
+    assert.deepEqual(step(state, { type: "disabled" }), { state: "watching", actions: [] }, state);
+  }
+  assert.deepEqual(step("compacting", { type: "disabled" }), { state: "compacting", actions: [] });
+  // and if it is disabled without the command (settings), pending states do nothing more
+  assert.deepEqual(step("requested", turn(90, { enabled: false })), { state: "watching", actions: [] });
+  assert.deepEqual(step("reminded", turn(90, { enabled: false })), { state: "watching", actions: [] });
+  assert.deepEqual(step("waiting", { type: "idle", compactAfterSave: true, enabled: false }), { state: "waiting", actions: [] });
+  assert.deepEqual(step("waiting", { type: "idle", compactAfterSave: true, enabled: true }), { state: "compacting", actions: ["compact"] });
+});
+
+test("checkpointPath: no session id can name the directory itself or its parent", () => {
+  const settings = { ...DEFAULTS, dir: "/checkpoints", file: "{session}" };
+  for (const sessionId of ["..", ".", "...", ""]) {
+    const path = checkpointPath({ settings, cwd: "/p", sessionId, home: "/home/adam" });
+    assert.ok(path.startsWith("/checkpoints/--p--/"), `${JSON.stringify(sessionId)} -> ${path}`);
+    assert.ok(!path.endsWith("/"), path);
+    assert.ok(path.length > "/checkpoints/--p--/".length, path);
+  }
+});
+
+test("directoryProblem: a checkpoint directory must be ours and closed to others", () => {
+  assert.equal(directoryProblem({ uid: 1000, mode: 0o40700 }, 1000), undefined);
+  assert.equal(directoryProblem({ uid: 1000, mode: 0o40750 }, 1000), undefined, "group-readable is fine");
+  assert.match(directoryProblem({ uid: 1001, mode: 0o40700 }, 1000), /owned by another user/);
+  assert.match(directoryProblem({ uid: 1000, mode: 0o40770 }, 1000), /writable by others/);
+  assert.match(directoryProblem({ uid: 1000, mode: 0o40707 }, 1000), /writable by others/);
+});
+
+test("injectRestore: a pending restore is added to the request until the session itself carries it", () => {
+  // pi appends a message sent during a run only at the END of the next turn, so
+  // after a mid-run compaction the first response would otherwise miss the note.
+  const user = { role: "user", content: [{ type: "text", text: "go on" }] };
+  const first = injectRestore([user], "RESTORE TEXT", 123);
+  assert.equal(first.delivered, false);
+  assert.equal(first.messages.length, 2);
+  assert.deepEqual(first.messages[1], { role: "custom", customType: RESTORE_TYPE, content: "RESTORE TEXT", display: true, timestamp: 123 });
+  assert.deepEqual(first.messages[0], user);
+
+  // once pi has stored it, nothing is added and the pending copy can be dropped
+  const stored = { role: "custom", customType: RESTORE_TYPE, content: "RESTORE TEXT", display: true, timestamp: 9 };
+  assert.deepEqual(injectRestore([user, stored], "RESTORE TEXT", 123), { delivered: true });
+  const storedAsParts = { ...stored, content: [{ type: "text", text: "RESTORE TEXT" }] };
+  assert.deepEqual(injectRestore([user, storedAsParts], "RESTORE TEXT", 123), { delivered: true });
+
+  // an older restore from an earlier compaction does not count
+  const older = { ...stored, content: "OLD RESTORE" };
+  assert.equal(injectRestore([user, older], "RESTORE TEXT", 123).messages.length, 3);
+  // nothing pending -> nothing to do
+  assert.deepEqual(injectRestore([user], undefined, 123), { delivered: false });
 });

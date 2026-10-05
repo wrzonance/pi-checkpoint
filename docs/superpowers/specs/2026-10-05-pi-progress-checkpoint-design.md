@@ -38,6 +38,22 @@ unchanged". The behaviour is now:
 - The restore message is appended to the session (not queued for the next user prompt), so a
   `/goal` continuation sees it as well as a typed prompt.
 
+Added after the Codex review (2026-10-05), all on the mid-run path:
+
+- **pi's compaction waits for the save.** One tool result can pass both the checkpoint threshold and
+  pi's trigger, and pi would compact before the model had answered the save request. While a save is
+  outstanding the extension cancels pi's *threshold* compaction, at most twice per request; an
+  overflow or a manual `/compact` is never held back.
+- **The restore reaches the first response after a mid-run compaction.** pi appends a message sent
+  during a run only at the end of the next turn, so until the session carries the restore message
+  the extension adds it to each request through the `context` hook.
+- **A compaction that fails or is put off does not cancel a pending checkpoint;** only the
+  extension's own failed compaction re-arms it.
+- `/checkpoint off` drops a pending request as well as stopping new ones.
+- The threshold uses pi's merged settings (`pi.getSettings()`), so project-level overrides count.
+- Saves go through an exclusively created, randomly named temporary file in a directory that must be
+  owned by the user and not writable by others; no session id can name the directory itself.
+
 Steps 5 and 6 under *Behaviour* are superseded by this section; `src/core.js` and its tests are the
 precise statement of the state machine.
 
