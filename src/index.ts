@@ -41,13 +41,13 @@ type Core = {
   DEFAULTS: Settings;
   REQUEST_TYPE: string;
   RESTORE_TYPE: string;
-  RESTORE_HEADER: string;
   INITIAL_STATE: string;
   resolveSettings(raw: unknown): { settings: Settings; warnings: string[] };
   checkpointPath(args: { settings: Settings; cwd: string; sessionId: string; home: string }): string;
   effectiveThreshold(args: { thresholdPercent: number; contextWindow: number; reserveTokens: number }): number;
   sizeProblem(content: unknown, maxChars: number): string | undefined;
   reserveTokensFor(piSettings: unknown, modelKey: string): number;
+  restoreMessage(saved: string): string;
   step(state: string, event: Record<string, unknown>): Step;
 };
 
@@ -69,6 +69,9 @@ export default function (pi: ExtensionAPI) {
   let piSettings: unknown;
   let state = core.INITIAL_STATE;
   let sessionEnabled = true;
+  // What this process saved last. Restores prefer it to the file: the file is
+  // only needed when pi was restarted since the save.
+  let lastSaved: string | undefined;
 
   const notify = (ctx: ExtensionContext, text: string, level: "info" | "warning" | "error" = "info") => {
     if (ctx.hasUI) ctx.ui.notify(`checkpoint: ${text}`, level);
@@ -86,18 +89,26 @@ export default function (pi: ExtensionAPI) {
     pi.sendMessage({ customType: core.REQUEST_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "steer" });
 
   const restore = async (ctx: ExtensionContext) => {
-    let saved: string;
-    try {
-      saved = await readFile(filePath(ctx), "utf8");
-    } catch (error) {
-      if (!isMissing(error)) notify(ctx, `could not read the saved progress: ${(error as Error).message}`, "warning");
-      return;
+    let saved = lastSaved;
+    if (saved === undefined) {
+      try {
+        saved = await readFile(filePath(ctx), "utf8");
+      } catch (error) {
+        if (!isMissing(error)) notify(ctx, `could not read the saved progress: ${(error as Error).message}`, "warning");
+        return;
+      }
+      // A file this process did not write gets the same limits as a save.
+      const problem = core.sizeProblem(saved, settings.maxChars);
+      if (problem) {
+        notify(ctx, `saved progress on disk was not restored: ${problem}`, "warning");
+        return;
+      }
     }
     // Appended to the session now (at the end of the turn if one is running), so
     // whatever runs next sees it: a /goal continuation as much as a user prompt.
     // "nextTurn" delivery would wait for the next *user* prompt only.
     pi.sendMessage(
-      { customType: core.RESTORE_TYPE, content: `${core.RESTORE_HEADER}\n\n${saved}`, display: true },
+      { customType: core.RESTORE_TYPE, content: core.restoreMessage(saved), display: true },
       { triggerTurn: false },
     );
   };
@@ -137,6 +148,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     state = core.INITIAL_STATE;
     sessionEnabled = true;
+    lastSaved = undefined;
     try {
       const resolved = core.resolveSettings(await readJson(SETTINGS_PATH));
       settings = resolved.settings;
@@ -200,6 +212,7 @@ export default function (pi: ExtensionAPI) {
       } catch (error) {
         throw new Error(`could not save progress to ${path}: ${(error as Error).message}`, { cause: error });
       }
+      lastSaved = params.content;
       state = core.step(state, { type: "saved" }).state;
       return {
         content: [{ type: "text", text: `Progress saved (${params.content.length} characters).` }],

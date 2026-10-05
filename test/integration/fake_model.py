@@ -64,7 +64,7 @@ def chunks(kind, payload, prompt_tokens):
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-        seen = [text_of(m)[:400] for m in body.get("messages", []) if m.get("role") != "system"]
+        seen = [text_of(m)[:2000] for m in body.get("messages", []) if m.get("role") != "system"]
         with open(REQUEST_LOG, "w", encoding="utf-8") as log:
             json.dump(seen, log)
         self.send_response(200)
