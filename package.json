@@ -1,0 +1,17 @@
+{
+  "name": "pi-checkpoint",
+  "version": "0.1.0",
+  "description": "pi extension: save progress to a per-session file before the context is compacted, and restore it afterwards",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "typebox": ">=1.1.24 <2.0.0"
+  }
+}
