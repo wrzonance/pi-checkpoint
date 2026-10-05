@@ -88,14 +88,28 @@ export function sizeProblem(content, maxChars) {
   return undefined;
 }
 
-// watching -> requested -> (reminded ->) saved -> compacting -> watching
-// `settled` replaces `compacting` when compactAfterSave is off: the request is
-// done and pi compacts on its own schedule.
+// pi's reserve for one model ("provider/id"): its override in settings.json
+// (compaction.modelOverrides), then the global value, then pi's default.
+const PI_DEFAULT_RESERVE_TOKENS = 16384;
+const isTokenCount = (v) => Number.isSafeInteger(v) && v >= 0;
+
+export function reserveTokensFor(piSettings, modelKey) {
+  const compaction = piSettings?.compaction ?? {};
+  const override = compaction.modelOverrides?.[modelKey]?.reserveTokens;
+  if (isTokenCount(override)) return override;
+  return isTokenCount(compaction.reserveTokens) ? compaction.reserveTokens : PI_DEFAULT_RESERVE_TOKENS;
+}
+
+// watching -> requested -> (reminded ->) waiting -> (compacting ->) watching
+//
+// The extension asks for the save; it does not compact a running agent.
+// ctx.compact() aborts the run, and pi-goal blocks a goal whose run was
+// aborted, so mid-run the cut is left to pi's own threshold compaction (which
+// does not abort). `waiting` is "done asking"; only when the agent goes idle
+// does the extension compact by itself.
 export const INITIAL_STATE = "watching";
 
-function onTurnEnd(state, { percent, threshold, enabled, compactAfterSave }) {
-  const finish = (actions) =>
-    compactAfterSave ? { state: "compacting", actions: [...actions, "compact"] } : { state: "settled", actions };
+function onTurnEnd(state, { percent, threshold, enabled }) {
   switch (state) {
     case "watching":
       return enabled && typeof percent === "number" && percent >= threshold
@@ -104,9 +118,7 @@ function onTurnEnd(state, { percent, threshold, enabled, compactAfterSave }) {
     case "requested":
       return { state: "reminded", actions: ["remind"] };
     case "reminded":
-      return finish(["warn_unsaved"]);
-    case "saved":
-      return finish([]);
+      return { state: "waiting", actions: ["warn_unsaved"] };
     default:
       return { state, actions: [] };
   }
@@ -117,7 +129,11 @@ export function step(state, event) {
     case "turn_end":
       return onTurnEnd(state, event);
     case "saved":
-      return state === "requested" || state === "reminded" ? { state: "saved", actions: [] } : { state, actions: [] };
+      return state === "requested" || state === "reminded" ? { state: "waiting", actions: [] } : { state, actions: [] };
+    case "idle":
+      return state === "waiting" && event.compactAfterSave
+        ? { state: "compacting", actions: ["compact"] }
+        : { state, actions: [] };
     case "compacted":
       return { state: "watching", actions: ["restore"] };
     case "compact_failed":

@@ -5,10 +5,14 @@
   "type": "module",
   "license": "MIT",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:integration": "test/integration/run.sh",
+    "test:all": "node --test test/*.test.js && test/integration/run.sh"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.0.0",

@@ -28,6 +28,21 @@ still says otherwise, this section wins:
   Adam's pi (`pi install`, which edits the fleet-synced `settings.json`) is NOT part of this plan:
   ask him first.
 
+## Amendment 2 — 2026-10-05: no compaction of a running agent
+
+Found in Task 3 (see the spec's *Revision* section): `ctx.compact()` aborts the run and pi-goal blocks an
+aborted goal. Changes against the task listings below:
+
+- State machine: `watching → requested → (reminded →) waiting → (compacting →) watching`. A save or an
+  exhausted reminder leads to `waiting`; a new `idle` event (from `agent_settled`) is the only thing
+  that produces the `compact` action. `saved`/`settled` states and `compactAfterSave` on `turn_end` are gone.
+- New pure function `reserveTokensFor(piSettings, "provider/id")` (per-model override, global, default).
+- Restore uses `pi.sendMessage(..., { triggerTurn: false })`, not `deliverAs: "nextTurn"`.
+- New: `test/integration/` — a scripted fake model and `run.sh`, which run the real extension inside
+  pi end to end without any model server.
+- Task 3 Steps 1, 5, 6 (the files in the home directory) and installation are deferred until Adam
+  decides how the extension is installed.
+
 ## Global Constraints
 
 - Files: `src/core.js`, `test/core.test.js`, `src/index.ts`, `~/.pi/agent/checkpoint.json`.

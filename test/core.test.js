@@ -12,6 +12,7 @@ import {
   sizeProblem,
   INITIAL_STATE,
   step,
+  reserveTokensFor,
 } from "../src/core.js";
 
 test("defaults match the spec", () => {
@@ -82,7 +83,7 @@ test("checkpointPath: an absolute dir is used as is, and a hostile session id ca
   assert.equal(path, "/var/tmp/cp/--p--/.._.._etc_passwd.md");
   assert.ok(path.startsWith("/var/tmp/cp/--p--/"));
 });
-const turn = (percent, extra = {}) => ({ type: "turn_end", percent, threshold: 80, enabled: true, compactAfterSave: true, ...extra });
+const turn = (percent, extra = {}) => ({ type: "turn_end", percent, threshold: 80, enabled: true, ...extra });
 
 test("effectiveThreshold: the configured percent on a large window, below pi's own trigger on a small one", () => {
   assert.equal(effectiveThreshold({ thresholdPercent: 80, contextWindow: 262144, reserveTokens: 8192 }), 80);
@@ -112,23 +113,25 @@ test("step: crossing the threshold requests a save once", () => {
   assert.deepEqual(step("watching", turn(80)), { state: "requested", actions: ["request"] });
 });
 
-test("step: a save after the request leads to compaction at the end of that turn", () => {
-  assert.deepEqual(step("requested", { type: "saved" }), { state: "saved", actions: [] });
-  assert.deepEqual(step("saved", turn(85)), { state: "compacting", actions: ["compact"] });
-  assert.deepEqual(step("compacting", turn(85)), { state: "compacting", actions: [] });
+test("step: a save ends the asking; a running agent is never compacted from here", () => {
+  // ctx.compact() aborts the run, and pi-goal blocks a goal whose run was aborted.
+  assert.deepEqual(step("requested", { type: "saved" }), { state: "waiting", actions: [] });
+  assert.deepEqual(step("reminded", { type: "saved" }), { state: "waiting", actions: [] });
+  assert.deepEqual(step("waiting", turn(99)), { state: "waiting", actions: [] });
 });
 
-test("step: no save -> one reminder -> compact anyway with a warning", () => {
+test("step: no save -> one reminder -> a warning, then it waits like after a save", () => {
   assert.deepEqual(step("requested", turn(85)), { state: "reminded", actions: ["remind"] });
-  assert.deepEqual(step("reminded", { type: "saved" }), { state: "saved", actions: [] });
-  assert.deepEqual(step("reminded", turn(88)), { state: "compacting", actions: ["warn_unsaved", "compact"] });
+  assert.deepEqual(step("reminded", turn(88)), { state: "waiting", actions: ["warn_unsaved"] });
 });
 
-test("step: with compactAfterSave off it settles instead of compacting", () => {
-  const off = { compactAfterSave: false };
-  assert.deepEqual(step("saved", turn(85, off)), { state: "settled", actions: [] });
-  assert.deepEqual(step("reminded", turn(85, off)), { state: "settled", actions: ["warn_unsaved"] });
-  assert.deepEqual(step("settled", turn(99, off)), { state: "settled", actions: [] });
+test("step: once the agent is idle, a waiting checkpoint compacts (unless compactAfterSave is off)", () => {
+  const idle = (compactAfterSave) => ({ type: "idle", compactAfterSave });
+  assert.deepEqual(step("waiting", idle(true)), { state: "compacting", actions: ["compact"] });
+  assert.deepEqual(step("waiting", idle(false)), { state: "waiting", actions: [] });
+  for (const state of ["watching", "requested", "reminded", "compacting"]) {
+    assert.deepEqual(step(state, idle(true)), { state, actions: [] }, state);
+  }
 });
 
 test("step: a voluntary save while watching changes nothing", () => {
@@ -136,7 +139,7 @@ test("step: a voluntary save while watching changes nothing", () => {
 });
 
 test("step: any compaction restores and re-arms; a failed one re-arms without restoring", () => {
-  for (const state of ["watching", "requested", "reminded", "saved", "compacting", "settled"]) {
+  for (const state of ["watching", "requested", "reminded", "waiting", "compacting"]) {
     assert.deepEqual(step(state, { type: "compacted" }), { state: "watching", actions: ["restore"] }, state);
     assert.deepEqual(step(state, { type: "compact_failed" }), { state: "watching", actions: [] }, state);
   }
@@ -144,4 +147,14 @@ test("step: any compaction restores and re-arms; a failed one re-arms without re
 
 test("step: an unknown event leaves the state alone", () => {
   assert.deepEqual(step("requested", { type: "nonsense" }), { state: "requested", actions: [] });
+});
+
+test("reserveTokensFor: the model's override, then the global setting, then pi's default", () => {
+  const settings = { compaction: { reserveTokens: 8192, modelOverrides: { "strata/strata-orca": { reserveTokens: 39322 } } } };
+  assert.equal(reserveTokensFor(settings, "strata/strata-orca"), 39322);
+  assert.equal(reserveTokensFor(settings, "wrzcluster/qwen3-coder"), 8192);
+  assert.equal(reserveTokensFor({}, "strata/strata-orca"), 16384);
+  assert.equal(reserveTokensFor(undefined, "x/y"), 16384);
+  assert.equal(reserveTokensFor({ compaction: { reserveTokens: -5 } }, "x/y"), 16384);
+  assert.equal(reserveTokensFor({ compaction: { reserveTokens: 8192, modelOverrides: { "x/y": { reserveTokens: "big" } } } }, "x/y"), 8192);
 });
