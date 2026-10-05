@@ -18,8 +18,44 @@ removed) still decides the cut and builds the summary.
 | Session awareness | One progress file per pi session. A new session starts empty; a resumed session reuses its own file; old files are kept but never read. |
 | Restore after compaction | The extension injects the file's contents into the context. |
 | Relation to repo files (e.g. `AUDIT.md`) | Separate. The hidden file is working memory only; repo files are untouched. |
-| Trigger | At 80% of the context window, then compact immediately after the save. |
+| Trigger | Ask for the save at 80% of the context window. Compaction: see *Revision* below (originally "compact immediately after the save"). |
 | pi-vcc | Augment. Add this extension's instruction message type to pi-vcc's `skipCustomTypes`. |
+
+## Revision — 2026-10-05, found during implementation
+
+"Compact immediately after the save" cannot be done to a running agent: `ctx.compact()` begins with
+an abort, and pi-goal marks a goal `blocked: user interrupted the turn` whenever its run is aborted.
+Compacting at every checkpoint would therefore stop every `/goal` loop, which contradicts "pi-goal:
+unchanged". The behaviour is now:
+
+- The extension asks for the save at the threshold and never compacts a running agent.
+- Mid-run, the cut is pi's own threshold compaction, which does not abort and which pi-vcc and
+  pi-goal already handle. To keep the saved note fresh, give a large model a per-model reserve in
+  pi's `settings.json` (`compaction.modelOverrides["provider/id"].reserveTokens`) so pi's trigger
+  sits about five points above the checkpoint threshold (for the 262K model: 39322 → pi compacts at 85%).
+- When the agent goes idle with a checkpoint outstanding, the extension compacts by itself
+  (`compactAfterSave`, default on); nothing is aborted because nothing is running.
+- The restore message is appended to the session (not queued for the next user prompt), so a
+  `/goal` continuation sees it as well as a typed prompt.
+
+Added after the Codex review (2026-10-05), all on the mid-run path:
+
+- **pi's compaction waits for the save.** One tool result can pass both the checkpoint threshold and
+  pi's trigger, and pi would compact before the model had answered the save request. While a save is
+  outstanding the extension cancels pi's *threshold* compaction, at most twice per request; an
+  overflow or a manual `/compact` is never held back.
+- **The restore reaches the first response after a mid-run compaction.** pi appends a message sent
+  during a run only at the end of the next turn, so until the session carries the restore message
+  the extension adds it to each request through the `context` hook.
+- **A compaction that fails or is put off does not cancel a pending checkpoint;** only the
+  extension's own failed compaction re-arms it.
+- `/checkpoint off` drops a pending request as well as stopping new ones.
+- The threshold uses pi's merged settings (`pi.getSettings()`), so project-level overrides count.
+- Saves go through an exclusively created, randomly named temporary file in a directory that must be
+  owned by the user and not writable by others; no session id can name the directory itself.
+
+Steps 5 and 6 under *Behaviour* are superseded by this section; `src/core.js` and its tests are the
+precise statement of the state machine.
 
 ## Behaviour
 
