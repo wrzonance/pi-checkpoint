@@ -142,9 +142,23 @@ test("step: a voluntary save while watching changes nothing", () => {
   assert.deepEqual(step("watching", { type: "saved" }), { state: "watching", actions: [] });
 });
 
-test("step: any compaction restores and re-arms", () => {
-  for (const state of ["watching", "requested", "reminded", "waiting", "compacting"]) {
-    assert.deepEqual(step(state, { type: "compacted" }), { state: "watching", actions: ["restore"] }, state);
+test("step: any compaction restores, then waits for usage to drop before arming again", () => {
+  for (const state of ["watching", "requested", "reminded", "waiting", "compacting", "cooling", "stalled"]) {
+    assert.deepEqual(step(state, { type: "compacted" }), { state: "cooling", actions: ["restore"] }, state);
+  }
+  // usage below the threshold after the cut: back to normal
+  assert.deepEqual(step("cooling", turn(10)), { state: "watching", actions: [] });
+  // unknown usage right after a compaction: keep waiting, no request
+  assert.deepEqual(step("cooling", turn(null)), { state: "cooling", actions: [] });
+  // still above the threshold right after the cut (the gap between the checkpoint
+  // threshold and pi's trigger is smaller than one save + compaction + restore):
+  // warn once, never re-request, so it cannot loop save -> compact -> save
+  assert.deepEqual(step("cooling", turn(85)), { state: "stalled", actions: ["warn_tight"] });
+  assert.deepEqual(step("stalled", turn(90)), { state: "stalled", actions: [] });
+  assert.deepEqual(step("stalled", turn(70)), { state: "watching", actions: [] });
+  for (const state of ["cooling", "stalled"]) {
+    assert.deepEqual(step(state, { type: "saved" }), { state, actions: [] }, state);
+    assert.deepEqual(step(state, { type: "idle", compactAfterSave: true, enabled: true }), { state, actions: [] }, state);
   }
 });
 
@@ -153,7 +167,7 @@ test("step: a failed compaction re-arms only our own; a pending checkpoint survi
   // compaction) as failed. The save request, or the wait for an idle moment,
   // must survive that: found by the mid-run integration scenario.
   assert.deepEqual(step("compacting", { type: "compact_failed" }), { state: "watching", actions: [] });
-  for (const state of ["watching", "requested", "reminded", "waiting"]) {
+  for (const state of ["watching", "requested", "reminded", "waiting", "cooling", "stalled"]) {
     assert.deepEqual(step(state, { type: "compact_failed" }), { state, actions: [] }, state);
   }
 });
@@ -225,7 +239,7 @@ test("shouldDeferCompaction: pi's threshold compaction waits while a save is out
 });
 
 test("step: switching off disarms a pending checkpoint and stops further automatic actions", () => {
-  for (const state of ["requested", "reminded", "waiting", "watching"]) {
+  for (const state of ["requested", "reminded", "waiting", "watching", "cooling", "stalled"]) {
     assert.deepEqual(step(state, { type: "disabled" }), { state: "watching", actions: [] }, state);
   }
   assert.deepEqual(step("compacting", { type: "disabled" }), { state: "compacting", actions: [] });

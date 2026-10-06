@@ -143,13 +143,16 @@ export function reserveTokensFor(piSettings, modelKey) {
   return isTokenCount(compaction.reserveTokens) ? compaction.reserveTokens : PI_DEFAULT_RESERVE_TOKENS;
 }
 
-// watching -> requested -> (reminded ->) waiting -> (compacting ->) watching
+// watching -> requested -> (reminded ->) waiting -> (compacting ->) cooling -> watching
 //
 // The extension asks for the save; it does not compact a running agent.
 // ctx.compact() aborts the run, and pi-goal blocks a goal whose run was
 // aborted, so mid-run the cut is left to pi's own threshold compaction (which
 // does not abort). `waiting` is "done asking"; only when the agent goes idle
-// does the extension compact by itself.
+// does the extension compact by itself. After any compaction, `cooling` waits
+// for usage to fall below the threshold before arming again: if the context is
+// still above it right after the cut, asking again would only loop
+// save -> compact -> save without the model doing any work (`stalled`: warned once).
 export const INITIAL_STATE = "watching";
 
 function onTurnEnd(state, { percent, threshold, enabled }) {
@@ -162,6 +165,12 @@ function onTurnEnd(state, { percent, threshold, enabled }) {
       return enabled ? { state: "reminded", actions: ["remind"] } : { state: "watching", actions: [] };
     case "reminded":
       return enabled ? { state: "waiting", actions: ["warn_unsaved"] } : { state: "watching", actions: [] };
+    case "cooling":
+    case "stalled": {
+      if (typeof percent !== "number") return { state, actions: [] };
+      if (percent < threshold) return { state: "watching", actions: [] };
+      return state === "cooling" ? { state: "stalled", actions: ["warn_tight"] } : { state, actions: [] };
+    }
     default:
       return { state, actions: [] };
   }
@@ -180,7 +189,7 @@ export function step(state, event) {
     case "disabled": // switched off: drop any pending checkpoint (a compaction already running finishes)
       return state === "compacting" ? { state, actions: [] } : { state: "watching", actions: [] };
     case "compacted":
-      return { state: "watching", actions: ["restore"] };
+      return { state: "cooling", actions: ["restore"] };
     case "compact_failed":
       // Only our own compaction failing re-arms. pi also reports a compaction we
       // put off, or a failed threshold compaction, as failed: a pending save

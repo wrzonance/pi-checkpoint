@@ -13,7 +13,13 @@ replace either.
 
 It never compacts a running agent, because that aborts the run. Mid-run the cut is pi's own threshold
 compaction; set a per-model `compaction.modelOverrides` reserve in pi's `settings.json` if you want
-that to follow the save closely on a large-context model.
+that to follow the save closely on a large-context model. Keep the gap between the checkpoint
+threshold and pi's trigger well above one save + compaction + restore (a few thousand tokens): if the
+context is still over the threshold right after a cut, the extension warns once and stops asking.
+
+With [pi-vcc](https://github.com/sting8k/pi-vcc), add both of this extension's message types to its
+`skipCustomTypes` so they stay out of its summaries (the restore is re-injected by this extension
+anyway): `"skipCustomTypes": ["progress-checkpoint-request", "progress-checkpoint"]`.
 
 ## Try it
 
