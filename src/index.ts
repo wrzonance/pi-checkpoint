@@ -156,6 +156,14 @@ export default function (pi: ExtensionAPI) {
       case "warn_unsaved":
         notify(ctx, "the model did not save its progress; any earlier save is kept", "warning");
         break;
+      case "warn_tight":
+        notify(
+          ctx,
+          "context is still above the checkpoint threshold right after a compaction; not asking again until it " +
+            "drops (raise thresholdPercent, or let pi compact later)",
+          "warning",
+        );
+        break;
       case "compact":
         ctx.compact({
           onError: (error) => {
